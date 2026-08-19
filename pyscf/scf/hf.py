@@ -169,14 +169,45 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     mf.cycles = 0
     for cycle in range(mf.max_cycle):
         dm_last = dm
+        vhf_last = vhf
         last_hf_e = e_tot
+
+        # The physical Fock matrix is the exact energy derivative at the old
+        # density.  Keep it separate from the matrix modified by DIIS,
+        # damping, or level shifting below.
+        fock_phys_last = numpy.asarray(h1e) + numpy.asarray(vhf_last)
 
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
-        vhf = mf.get_veff(mol, dm, dm_last, vhf)
+        vhf = mf.get_veff(mol, dm, dm_last, vhf_last)
         e_tot = mf.energy_tot(dm, h1e, vhf)
+
+        # Fit E(alpha) = E(0) + alpha E'(0) + c alpha**2 from
+        # the exact old derivative and the two exact endpoint energies.  A
+        # predicted interior minimum is accepted only after an exact build
+        # verifies both sufficient decrease and improvement over alpha = 1.
+        ddm = numpy.asarray(dm) - numpy.asarray(dm_last)
+        de0 = numpy.einsum('...ij,...ji->', fock_phys_last, ddm).real
+        curvature = e_tot - last_hf_e - de0
+        line_search_alpha = 1.
+        if de0 < 0 and curvature > 0:
+            alpha = -de0 / (2 * curvature)
+            if 0 < alpha < 1:
+                e_model = last_hf_e + alpha * de0 + alpha**2 * curvature
+                if e_model < e_tot - conv_tol:
+                    dm_probe = dm_last + alpha * ddm
+                    vhf_probe = mf.get_veff(mol, dm_probe, dm_last, vhf_last)
+                    e_probe = mf.energy_tot(dm_probe, h1e, vhf_probe)
+                    if (e_probe <= last_hf_e + 1e-4 * alpha * de0 and
+                            e_probe < e_tot):
+                        dm, vhf, e_tot = dm_probe, vhf_probe, e_probe
+                        line_search_alpha = alpha
+                    else:
+                        # energy_tot updates scf_summary; restore the selected
+                        # endpoint's summary after rejecting the probe.
+                        mf.energy_tot(dm, h1e, vhf)
 
         # Here Fock matrix is h1e + vhf, without DIIS.  Calling get_fock
         # instead of the statement "fock = h1e + vhf" because Fock matrix may
