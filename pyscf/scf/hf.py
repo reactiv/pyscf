@@ -164,6 +164,27 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     # A preprocessing hook before the SCF iteration
     mf.pre_kernel(locals())
 
+    # Direct-SCF J/K is linear in the density.  For hybrid RKS objects the
+    # tagged effective potential exposes the accumulated J and K matrices,
+    # which lets a few contracting density updates share one integral build.
+    # The XC part is still evaluated at every density: a deferred update calls
+    # get_veff with a zero density difference and the J/K anchor tags.
+    jk_anchor_dm = numpy.array(dm, copy=True)
+    jk_anchor_vhf = vhf
+    jk_coalescing = (getattr(mf, 'direct_scf', False) and
+                     numpy.asarray(dm).ndim == 2 and
+                     getattr(vhf, 'vj', None) is not None and
+                     getattr(vhf, 'vk', None) is not None)
+    jk_validation_required = jk_coalescing
+    jk_coalescing_used = False
+    jk_deferred = 0
+    jk_refreshes = 0
+    jk_response = None
+    jk_response_dm_norm = None
+    jk_prev_step_norm = None
+    jk_prev_residual = None
+    jk_drift = None
+
     fock_last = None
     cput1 = log.timer('initialize scf', *cput0)
     mf.cycles = 0
@@ -175,7 +196,64 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
-        vhf = mf.get_veff(mol, dm, dm_last, vhf)
+        jk_step_norm = numpy.linalg.norm(dm - dm_last)
+        jk_cumulative_norm = numpy.linalg.norm(dm - jk_anchor_dm)
+        jk_omission_bound = None
+        jk_coalescing_action = 'disabled'
+        defer_jk = False
+        if (jk_coalescing and jk_deferred < 2 and
+            jk_response is not None and jk_response_dm_norm > 0 and
+            jk_prev_residual is not None and jk_prev_step_norm is not None and
+            jk_step_norm < jk_prev_step_norm):
+            response_scale = jk_cumulative_norm / jk_response_dm_norm
+            estimated_response = jk_response * response_scale
+            jk_omission_bound = numpy.linalg.norm(
+                mf.get_grad(mo_coeff, mo_occ, estimated_response))
+            if not TIGHT_GRAD_CONV_TOL:
+                jk_omission_bound /= numpy.sqrt(jk_omission_bound.size)
+            defer_jk = jk_omission_bound < .25 * jk_prev_residual
+
+        if defer_jk:
+            # dm-dm is exactly zero, so get_veff updates XC while retaining
+            # the J/K carried by the last refresh.
+            vhf = mf.get_veff(mol, dm, dm, jk_anchor_vhf)
+            jk_deferred += 1
+            jk_coalescing_used = True
+            jk_coalescing_action = 'defer'
+        elif jk_coalescing:
+            incremental_vhf = mf.get_veff(
+                mol, dm, jk_anchor_dm, jk_anchor_vhf)
+            delta_j = incremental_vhf.vj - jk_anchor_vhf.vj
+            delta_k = incremental_vhf.vk - jk_anchor_vhf.vk
+            jk_response = delta_j - delta_k * .5
+            jk_response_dm_norm = jk_cumulative_norm
+            jk_refreshes += 1
+            jk_coalescing_action = 'refresh'
+
+            if jk_refreshes == 4:
+                full_vhf = mf.get_veff(mol, dm)
+                delta_j = incremental_vhf.vj - full_vhf.vj
+                delta_k = incremental_vhf.vk - full_vhf.vk
+                jk_drift = abs(.5 * numpy.einsum(
+                    'ij,ji->', dm, delta_j).real -
+                               .25 * numpy.einsum(
+                    'ij,ji->', dm, delta_k).real)
+                vhf = full_vhf
+                jk_refreshes = 0
+                jk_coalescing_action = 'checkpoint'
+                if jk_drift > 1e-9:
+                    jk_coalescing = False
+                    jk_coalescing_action = 'drift-fallback'
+                    log.warn('Disable J/K coalescing: checkpoint drift %.3g',
+                             jk_drift)
+            else:
+                vhf = incremental_vhf
+
+            jk_anchor_dm = numpy.array(dm, copy=True)
+            jk_anchor_vhf = vhf
+            jk_deferred = 0
+        else:
+            vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
 
         # Here Fock matrix is h1e + vhf, without DIIS.  Calling get_fock
@@ -187,13 +265,44 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         if not TIGHT_GRAD_CONV_TOL:
             norm_gorb = norm_gorb / numpy.sqrt(norm_gorb.size)
         norm_ddm = numpy.linalg.norm(dm-dm_last)
-        log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
-                 cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
 
         if callable(mf.check_convergence):
             scf_conv = mf.check_convergence(locals())
         elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
             scf_conv = True
+
+        if scf_conv and jk_validation_required and jk_coalescing_used:
+            # A stale J/K can make the provisional residual look converged.
+            # Rebuild now and continue iterating unless the full-density
+            # energy, commutator, and relative density step are all tight.
+            vhf = mf.get_veff(mol, dm)
+            e_tot = mf.energy_tot(dm, h1e, vhf)
+            fock = mf.get_fock(h1e, s1e, vhf, dm)
+            norm_gorb = numpy.linalg.norm(
+                mf.get_grad(mo_coeff, mo_occ, fock))
+            if not TIGHT_GRAD_CONV_TOL:
+                norm_gorb /= numpy.sqrt(norm_gorb.size)
+            validation_grad_tol = conv_tol_grad * .001
+            validation_dm_tol = (validation_grad_tol *
+                                 max(numpy.linalg.norm(dm), 1.))
+            scf_conv = (abs(e_tot-last_hf_e) < conv_tol and
+                        norm_gorb < validation_grad_tol and
+                        norm_ddm < validation_dm_tol)
+            jk_anchor_dm = numpy.array(dm, copy=True)
+            jk_anchor_vhf = vhf
+            jk_deferred = 0
+            jk_refreshes = 0
+            jk_response = None
+            jk_response_dm_norm = None
+            jk_coalescing_action = 'convergence-full'
+
+        log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
+                 cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
+        if jk_validation_required:
+            log.debug('J/K coalescing %s  estimated response= %s  drift= %s',
+                      jk_coalescing_action, jk_omission_bound, jk_drift)
+        jk_prev_step_norm = jk_step_norm
+        jk_prev_residual = norm_gorb
 
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
@@ -207,13 +316,18 @@ Keyword argument "init_dm" is replaced by "dm0"''')
             break
 
     mf.cycles = cycle + 1
-    if scf_conv and conv_check:
+    if scf_conv and (conv_check or jk_validation_required):
         # An extra diagonalization, to remove level shift
         #fock = mf.get_fock(h1e, s1e, vhf, dm)  # = h1e + vhf
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
-        vhf = mf.get_veff(mol, dm, dm_last, vhf)
+        if jk_validation_required:
+            # Convergence is accepted only against a fresh full-density J/K.
+            vhf = mf.get_veff(mol, dm)
+            jk_coalescing_action = 'final-full'
+        else:
+            vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot, last_hf_e = mf.energy_tot(dm, h1e, vhf), e_tot
 
         fock = mf.get_fock(h1e, s1e, vhf, dm, level_shift_factor=0)
