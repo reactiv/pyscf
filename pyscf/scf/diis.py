@@ -141,7 +141,7 @@ class CDIIS(lib.diis.DIIS):
             f_diis = f
         else:
             f_diis = f*(1-self.damp) + f_prev*self.damp
-        if self._admit(errvec):
+        if self.rollback > 0 or self._admit(errvec):
             xnew = lib.diis.DIIS.update(self, f_diis, xerr=errvec)
         else:
             xnew = self.extrapolate().reshape(f.shape)
