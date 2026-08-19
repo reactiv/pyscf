@@ -165,13 +165,20 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     mf.pre_kernel(locals())
 
     fock_last = None
+    adaptive_level_shift = 0.
+    adaptive_shift_latched = False
+    adaptive_shift_enabled = mf.level_shift == 0
+    frontier_gap = None
     cput1 = log.timer('initialize scf', *cput0)
     mf.cycles = 0
     for cycle in range(mf.max_cycle):
         dm_last = dm
         last_hf_e = e_tot
 
-        fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
+        level_shift_factor = adaptive_level_shift if adaptive_shift_enabled else None
+        fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis,
+                           fock_last=fock_last,
+                           level_shift_factor=level_shift_factor)
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
@@ -186,6 +193,24 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         norm_gorb = numpy.linalg.norm(mf.get_grad(mo_coeff, mo_occ, fock))
         if not TIGHT_GRAD_CONV_TOL:
             norm_gorb = norm_gorb / numpy.sqrt(norm_gorb.size)
+        if adaptive_shift_enabled:
+            if adaptive_shift_latched or norm_gorb <= 10 * conv_tol_grad:
+                adaptive_level_shift = 0.
+                adaptive_shift_latched = True
+            elif (numpy.ndim(fock) == 2 and numpy.ndim(mo_coeff) == 2 and
+                  numpy.ndim(mo_occ) == 1):
+                occupied = numpy.where(mo_occ > 0)[0]
+                virtual = numpy.where(mo_occ == 0)[0]
+                if occupied.size and virtual.size:
+                    homo = occupied[numpy.argmax(mo_energy[occupied])]
+                    lumo = virtual[numpy.argmin(mo_energy[virtual])]
+                    c_homo = mo_coeff[:, homo]
+                    c_lumo = mo_coeff[:, lumo]
+                    e_homo = numpy.vdot(c_homo, fock.dot(c_homo)).real
+                    e_lumo = numpy.vdot(c_lumo, fock.dot(c_lumo)).real
+                    frontier_gap = e_lumo - e_homo
+                    adaptive_level_shift = min(
+                        .5, norm_gorb**2 / (max(frontier_gap, 0.) + norm_gorb))
         norm_ddm = numpy.linalg.norm(dm-dm_last)
         log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
                  cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
