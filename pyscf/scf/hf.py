@@ -204,7 +204,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         e_tot = mf.energy_tot(dm, h1e, vhf)
 
         predicted_decrease = -trust_alpha * numpy.einsum(
-            '...ij,...ji->', fock_model, raw_step).real
+            '...ij,...ji', fock_model, raw_step).sum().real
         if predicted_decrease > numpy.finfo(float).eps:
             trust_rho = (last_hf_e - e_tot) / predicted_decrease
         else:
