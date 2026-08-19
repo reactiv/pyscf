@@ -164,6 +164,27 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     # A preprocessing hook before the SCF iteration
     mf.pre_kernel(locals())
 
+    # Direct hybrid-DFT builds tag the separately accumulated J and K
+    # potentials.  Keep that exact J/K anchor while the local XC potential is
+    # still evaluated at every density.  Contracting density steps can then be
+    # coalesced into one cumulative direct-SCF build without changing the
+    # density represented by the next refreshed J/K potential.
+    jk_coalesce = (getattr(mf, 'direct_scf', False) and
+                   getattr(mf, '_eri', None) is None and
+                   numpy.asarray(dm).ndim == 2 and
+                   getattr(vhf, 'vj', None) is not None and
+                   getattr(vhf, 'vk', None) is not None)
+    jk_anchor_dm = dm
+    jk_anchor_vhf = vhf
+    jk_response_scale = None
+    jk_last_step_norm = None
+    jk_omitted_bound = 0.
+    jk_deferred = 0
+    jk_refreshes = 0
+    jk_fresh = True
+    jk_full_density = True
+    prev_norm_gorb = None
+
     fock_last = None
     cput1 = log.timer('initialize scf', *cput0)
     mf.cycles = 0
@@ -175,7 +196,66 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
-        vhf = mf.get_veff(mol, dm, dm_last, vhf)
+        dm_step_norm = numpy.linalg.norm(dm-dm_last)
+        can_defer_jk = False
+        if (jk_coalesce and jk_response_scale is not None and
+            jk_last_step_norm is not None and prev_norm_gorb is not None and
+            jk_refreshes >= 2 and prev_norm_gorb < conv_tol_grad**.25):
+            omitted_bound = jk_omitted_bound + jk_response_scale * dm_step_norm
+            can_defer_jk = (jk_deferred < 2 and
+                            dm_step_norm < jk_last_step_norm and
+                            omitted_bound <= .25 * prev_norm_gorb)
+
+        if can_defer_jk:
+            # A zero density difference preserves the anchor J/K tags while
+            # get_veff still evaluates the local XC response at the new dm.
+            vhf = mf.get_veff(mol, dm, dm, jk_anchor_vhf)
+            jk_omitted_bound = omitted_bound
+            jk_deferred += 1
+            jk_fresh = False
+            jk_full_density = False
+        elif jk_coalesce:
+            anchor_dm = jk_anchor_dm
+            anchor_vhf = jk_anchor_vhf
+            vhf = mf.get_veff(mol, dm, anchor_dm, anchor_vhf)
+            ddm_norm = numpy.linalg.norm(dm-anchor_dm)
+            if ddm_norm > 0:
+                dvj = numpy.asarray(vhf.vj) - numpy.asarray(anchor_vhf.vj)
+                dvk = numpy.asarray(vhf.vk) - numpy.asarray(anchor_vhf.vk)
+                djk = dvj - dvk * .5
+                response = numpy.linalg.norm(
+                    mf.get_grad(mo_coeff, mo_occ, djk))
+                response_scale = response / ddm_norm
+                if jk_response_scale is None:
+                    jk_response_scale = response_scale
+                else:
+                    jk_response_scale = max(jk_response_scale, response_scale)
+            jk_anchor_dm = dm
+            jk_anchor_vhf = vhf
+            jk_omitted_bound = 0.
+            jk_deferred = 0
+            jk_refreshes += 1
+            jk_fresh = True
+            jk_full_density = False
+
+            if jk_refreshes % 4 == 0:
+                vhf_inc = vhf
+                vhf = mf.get_veff(mol, dm)
+                dj = numpy.asarray(vhf_inc.vj) - numpy.asarray(vhf.vj)
+                dk = numpy.asarray(vhf_inc.vk) - numpy.asarray(vhf.vk)
+                drift = (.5 * numpy.einsum('...ij,...ji->...', dm, dj).real.sum()
+                         - .25 * numpy.einsum('...ij,...ji->...', dm, dk).real.sum())
+                jk_anchor_dm = dm
+                jk_anchor_vhf = vhf
+                jk_full_density = True
+                if abs(drift) > 1e-9:
+                    jk_coalesce = False
+                    log.warn('Incremental J/K drift %.3g; disabling coalescing',
+                             drift)
+        else:
+            vhf = mf.get_veff(mol, dm, dm_last, vhf)
+            jk_fresh = True
+            jk_full_density = False
         e_tot = mf.energy_tot(dm, h1e, vhf)
 
         # Here Fock matrix is h1e + vhf, without DIIS.  Calling get_fock
@@ -195,6 +275,29 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
             scf_conv = True
 
+        # Convergence is only accepted against a fresh full-density J/K build.
+        # Recompute both energy and commutator metrics after replacing any
+        # coalesced potential by the full result.
+        if scf_conv and jk_coalesce:
+            if not jk_full_density:
+                vhf = mf.get_veff(mol, dm)
+            jk_anchor_dm = dm
+            jk_anchor_vhf = vhf
+            jk_omitted_bound = 0.
+            jk_deferred = 0
+            jk_fresh = True
+            jk_full_density = True
+            e_tot = mf.energy_tot(dm, h1e, vhf)
+            fock = mf.get_fock(h1e, s1e, vhf, dm)
+            norm_gorb = numpy.linalg.norm(mf.get_grad(mo_coeff, mo_occ, fock))
+            if not TIGHT_GRAD_CONV_TOL:
+                norm_gorb = norm_gorb / numpy.sqrt(norm_gorb.size)
+            if callable(mf.check_convergence):
+                scf_conv = mf.check_convergence(locals())
+            else:
+                scf_conv = (abs(e_tot-last_hf_e) < conv_tol and
+                            norm_gorb < conv_tol_grad)
+
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
 
@@ -203,17 +306,31 @@ Keyword argument "init_dm" is replaced by "dm0"''')
 
         cput1 = log.timer('cycle= %d'%(cycle+1), *cput1)
 
+        jk_last_step_norm = dm_step_norm
+        prev_norm_gorb = norm_gorb
+
         if scf_conv:
             break
 
     mf.cycles = cycle + 1
+    if jk_coalesce and not jk_full_density:
+        # Never return an energy evaluated with an omitted J/K response, even
+        # when max_cycle is reached before convergence.
+        vhf = mf.get_veff(mol, dm)
+        jk_anchor_dm = dm
+        jk_anchor_vhf = vhf
+        jk_fresh = True
+        jk_full_density = True
+        e_tot = mf.energy_tot(dm, h1e, vhf)
+        fock = mf.get_fock(h1e, s1e, vhf, dm)
     if scf_conv and conv_check:
         # An extra diagonalization, to remove level shift
         #fock = mf.get_fock(h1e, s1e, vhf, dm)  # = h1e + vhf
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
-        vhf = mf.get_veff(mol, dm, dm_last, vhf)
+        # Mandatory full-density validation of the final reported state.
+        vhf = mf.get_veff(mol, dm)
         e_tot, last_hf_e = mf.energy_tot(dm, h1e, vhf), e_tot
 
         fock = mf.get_fock(h1e, s1e, vhf, dm, level_shift_factor=0)
