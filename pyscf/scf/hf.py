@@ -165,6 +165,8 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     mf.pre_kernel(locals())
 
     fock_last = None
+    residual_history = []
+    soscf_cooldown = 0
     cput1 = log.timer('initialize scf', *cput0)
     mf.cycles = 0
     for cycle in range(mf.max_cycle):
@@ -189,6 +191,53 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         norm_ddm = numpy.linalg.norm(dm-dm_last)
         log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
                  cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
+
+        residual_history.append(norm_gorb)
+        residual_history = residual_history[-4:]
+        if soscf_cooldown > 0:
+            soscf_cooldown -= 1
+        stalled = (len(residual_history) == 4 and
+                   min(residual_history[1:]) > .8 * residual_history[0])
+        if (stalled and norm_gorb > 10 * conv_tol_grad and
+                soscf_cooldown == 0):
+            from pyscf.soscf import newton_ah
+            pre_rescue_summary = mf.scf_summary.copy()
+            soscf = newton_ah.newton(mf)
+            _, _, rescue_mo_energy, rescue_mo_coeff, rescue_mo_occ = \
+                    newton_ah.kernel(
+                        soscf, mo_coeff, mo_occ,
+                        conv_tol=conv_tol, conv_tol_grad=conv_tol_grad,
+                        max_cycle=1, dump_chk=False, callback=None,
+                        verbose=log)
+            rescue_dm = mf.make_rdm1(rescue_mo_coeff, rescue_mo_occ)
+            # The acceptance test deliberately uses a full, fresh potential.
+            rescue_vhf = mf.get_veff(mol, rescue_dm)
+            rescue_e_tot = mf.energy_tot(rescue_dm, h1e, rescue_vhf)
+            rescue_fock = mf.get_fock(h1e, s1e, rescue_vhf, rescue_dm)
+            rescue_norm_gorb = numpy.linalg.norm(
+                mf.get_grad(rescue_mo_coeff, rescue_mo_occ, rescue_fock))
+            if not TIGHT_GRAD_CONV_TOL:
+                rescue_norm_gorb /= numpy.sqrt(rescue_norm_gorb.size)
+
+            if rescue_norm_gorb <= .7 * norm_gorb:
+                log.info('SOSCF rescue accepted: |g|= %4.3g -> %4.3g',
+                         norm_gorb, rescue_norm_gorb)
+                mo_energy = rescue_mo_energy
+                mo_coeff = rescue_mo_coeff
+                mo_occ = rescue_mo_occ
+                dm = rescue_dm
+                vhf = rescue_vhf
+                e_tot = rescue_e_tot
+                fock = rescue_fock
+                norm_gorb = rescue_norm_gorb
+                norm_ddm = numpy.linalg.norm(dm-dm_last)
+                residual_history = [norm_gorb]
+            else:
+                log.info('SOSCF rescue rejected: |g|= %4.3g -> %4.3g',
+                         norm_gorb, rescue_norm_gorb)
+                mf.scf_summary.clear()
+                mf.scf_summary.update(pre_rescue_summary)
+            soscf_cooldown = 4
 
         if callable(mf.check_convergence):
             scf_conv = mf.check_convergence(locals())
