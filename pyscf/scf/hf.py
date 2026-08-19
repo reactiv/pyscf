@@ -200,8 +200,14 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         else:
             dm = numpy.asarray(dm_last) + trust_alpha * trust_step
 
+        trust_model_fock = numpy.asarray(trust_fock)
+        if trust_model_fock.shape != trust_step.shape:
+            # ROHF diagonalizes a two-dimensional effective Fock but carries
+            # spin-resolved densities.  Its physical alpha/beta Fock matrices
+            # are the energy derivatives matching that density shape.
+            trust_model_fock = numpy.asarray(h1e) + numpy.asarray(vhf)
         trust_predicted = -trust_alpha * numpy.vdot(
-            numpy.asarray(trust_fock), trust_step).real
+            trust_model_fock, trust_step).real
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
 
