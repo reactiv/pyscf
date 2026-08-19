@@ -164,6 +164,34 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     # A preprocessing hook before the SCF iteration
     mf.pre_kernel(locals())
 
+    def set_direct_scf_cutoff(cutoff):
+        nopt = 0
+        seen = set()
+
+        def update_opt(opt):
+            nonlocal nopt
+            if opt is None or id(opt) in seen:
+                return
+            seen.add(id(opt))
+            if isinstance(opt, dict):
+                for value in opt.values():
+                    update_opt(value)
+            elif isinstance(opt, (tuple, list)):
+                for value in opt:
+                    update_opt(value)
+            elif hasattr(opt, 'direct_scf_tol'):
+                opt.direct_scf_tol = cutoff
+                nopt += 1
+
+        update_opt(getattr(mf, '_opt', None))
+        return nopt
+
+    reference_cutoff = mf.direct_scf_tol
+    adaptive_screening = (mf.direct_scf and reference_cutoff > 0 and
+                          set_direct_scf_cutoff(reference_cutoff) > 0)
+    adaptive_cutoff = numpy.sqrt(reference_cutoff)
+    screening_stage = 'reference_head'
+
     fock_last = None
     cput1 = log.timer('initialize scf', *cput0)
     mf.cycles = 0
@@ -191,9 +219,40 @@ Keyword argument "init_dm" is replaced by "dm0"''')
                  cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
 
         if callable(mf.check_convergence):
-            scf_conv = mf.check_convergence(locals())
-        elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
-            scf_conv = True
+            cycle_converged = mf.check_convergence(locals())
+        else:
+            cycle_converged = (abs(e_tot-last_hf_e) < conv_tol and
+                               norm_gorb < conv_tol_grad)
+
+        if adaptive_screening and screening_stage != 'strict':
+            next_cutoff = reference_cutoff * max(
+                1., norm_gorb / conv_tol_grad)**2
+            next_cutoff = min(adaptive_cutoff,
+                              numpy.sqrt(reference_cutoff), next_cutoff)
+            if cycle_converged or next_cutoff <= reference_cutoff:
+                # Discard all accumulated screening error before entering the
+                # strict convergence tail.  Omitting dm_last and vhf_last
+                # forces a full-density J/K rebuild at the reference cutoff.
+                set_direct_scf_cutoff(reference_cutoff)
+                adaptive_cutoff = reference_cutoff
+                screening_stage = 'strict'
+                vhf = mf.get_veff(mol, dm)
+                e_tot = mf.energy_tot(dm, h1e, vhf)
+                fock = mf.get_fock(h1e, s1e, vhf, dm)
+                norm_gorb = numpy.linalg.norm(
+                    mf.get_grad(mo_coeff, mo_occ, fock))
+                if not TIGHT_GRAD_CONV_TOL:
+                    norm_gorb = norm_gorb / numpy.sqrt(norm_gorb.size)
+            else:
+                adaptive_cutoff = next_cutoff
+                set_direct_scf_cutoff(adaptive_cutoff)
+                screening_stage = 'adaptive'
+            # A cycle that selected an adaptive cutoff, or initiated cleanup,
+            # cannot declare convergence.  At least one subsequent ordinary
+            # cycle must pass at the reference cutoff.
+            scf_conv = False
+        else:
+            scf_conv = cycle_converged
 
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
