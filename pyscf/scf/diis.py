@@ -210,6 +210,124 @@ class ADIIS(lib.diis.DIIS):
         self._head += 1
         return fock
 
+
+class HystereticDIIS(lib.diis.DIIS):
+    '''Energy--commutator controller for EDIIS, ADIIS, and CDIIS.
+
+    All three extrapolators are updated on every call so that switching does
+    not start from an empty subspace.  The controller only chooses which of
+    the three extrapolated Fock matrices is returned.
+    '''
+    def __init__(self, mf=None, filename=None, Corth=None):
+        lib.diis.DIIS.__init__(self, mf, filename)
+        self.rollback = 0
+        self.space = 8
+        self.Corth = Corth
+        self.damp = 0
+        self.conv_tol = 1e-9
+        self.conv_tol_grad = numpy.sqrt(self.conv_tol)
+
+        self._cdiis = CDIIS(mf, _subspace_filename(filename, 'cdiis'), Corth)
+        self._adiis = ADIIS(mf, _subspace_filename(filename, 'adiis'))
+        self._ediis = EDIIS(mf, _subspace_filename(filename, 'ediis'))
+        self._phase = 'ediis'
+        self._pending_phase = None
+        self._pending_count = 0
+        self._last_energy = None
+        self._last_residual = None
+
+    def update(self, s, d, f, mf, h1e, vhf, *args, **kwargs):
+        self._sync_extrapolators()
+
+        energy = mf.energy_elec(d, h1e, vhf)[0]
+        errvec = get_err_vec(s, d, f, self.Corth)
+        residual = numpy.linalg.norm(errvec) / numpy.sqrt(errvec.size)
+        if self._last_residual is None or self._last_residual == 0:
+            q = numpy.inf
+        else:
+            q = residual / self._last_residual
+
+        energy_noise = max(self.conv_tol * .1, 100 * numpy.finfo(float).eps)
+        if self._last_energy is None:
+            energy_change = 0.
+            requested = 'ediis'
+        else:
+            energy_change = energy - self._last_energy
+            if energy_change > energy_noise or q > 1.1:
+                requested = 'ediis'
+            elif residual <= 10 * self.conv_tol_grad or q <= .7:
+                requested = 'cdiis'
+            else:
+                requested = 'adiis'
+
+        self._select_phase(requested, q)
+
+        # Keep independent, warm histories.  No extrapolator's minimization or
+        # subspace policy is modified by the controller.
+        focks = {
+            'ediis': self._ediis.update(s, d, f, mf, h1e, vhf,
+                                        *args, **kwargs),
+            'adiis': self._adiis.update(s, d, f, mf, h1e, vhf,
+                                        *args, **kwargs),
+            'cdiis': self._cdiis.update(s, d, f, mf, h1e, vhf,
+                                        *args, **kwargs),
+        }
+        logger.debug1(self, 'hybrid-diis phase=%s dE=%g r=%g q=%g',
+                      self._phase, energy_change, residual, q)
+        self._last_energy = energy
+        self._last_residual = residual
+        return focks[self._phase]
+
+    def _select_phase(self, requested, q):
+        # Divergence is handled immediately.  Transitions toward a more
+        # aggressive method need two consecutive samples; CDIIS falls back to
+        # ADIIS only after two samples beyond the wider q=0.8 boundary.
+        if requested == 'ediis':
+            self._phase = 'ediis'
+            self._pending_phase = None
+            self._pending_count = 0
+            return
+
+        if self._phase == 'cdiis' and requested == 'adiis' and q <= .8:
+            self._pending_phase = None
+            self._pending_count = 0
+            return
+
+        if self._phase == 'ediis' and requested == 'cdiis':
+            requested = 'adiis'
+
+        if requested == self._phase:
+            self._pending_phase = None
+            self._pending_count = 0
+        elif requested == self._pending_phase:
+            self._pending_count += 1
+        else:
+            self._pending_phase = requested
+            self._pending_count = 1
+
+        if self._pending_count >= 2:
+            self._phase = requested
+            self._pending_phase = None
+            self._pending_count = 0
+
+    def _sync_extrapolators(self):
+        for obj in (self._ediis, self._adiis, self._cdiis):
+            obj.space = self.space
+            obj.verbose = self.verbose
+            obj.stdout = self.stdout
+        self._cdiis.rollback = self.rollback
+        self._cdiis.damp = self.damp
+        self._cdiis.Corth = self.Corth
+
+    def get_num_vec(self):
+        return self._cdiis.get_num_vec()
+
+
+def _subspace_filename(filename, suffix):
+    if filename is None:
+        return None
+    return '%s.%s' % (filename, suffix)
+
 def adiis_minimize(ds, fs, idnewest):
     nx = ds.shape[0]
     nao = ds.shape[-1]

@@ -153,6 +153,9 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         mf_diis.rollback = mf.diis_space_rollback
         mf_diis.damp = mf.diis_damp
         mf_diis.Corth = x_orth
+        if isinstance(mf_diis, diis.HystereticDIIS):
+            mf_diis.conv_tol = conv_tol
+            mf_diis.conv_tol_grad = conv_tol_grad
     else:
         mf_diis = None
 
@@ -1744,7 +1747,7 @@ class SCF(lib.StreamObject):
 
     # To avoid diis pollution from previous run, self.diis should not be
     # initialized as DIIS instance here
-    DIIS = diis.SCF_DIIS
+    DIIS = diis.HystereticDIIS
     diis = getattr(__config__, 'scf_hf_SCF_diis', True)
     diis_space = getattr(__config__, 'scf_hf_SCF_diis_space', 8)
     diis_damp = getattr(__config__, 'scf_hf_SCF_diis_damp', 0)
