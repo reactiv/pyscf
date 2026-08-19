@@ -39,7 +39,7 @@ DEBUG = False
 # error vector = F_ai ~ (S-SDS)*S^{-1}FDS = FDS - SDFDS ~ FDS-SDF in converge
 class CDIIS(lib.diis.DIIS):
     def __init__(self, mf=None, filename=None, Corth=None):
-        lib.diis.DIIS.__init__(self, mf, None)
+        lib.diis.DIIS.__init__(self, mf, filename)
         self.rollback = 0
         self.space = 8
         self.Corth = Corth
@@ -219,7 +219,7 @@ class HystereticDIIS(lib.diis.DIIS):
     the three extrapolated Fock matrices is returned.
     '''
     def __init__(self, mf=None, filename=None, Corth=None):
-        lib.diis.DIIS.__init__(self, mf, filename)
+        lib.diis.DIIS.__init__(self, mf, None)
         self.rollback = 0
         self.space = 8
         self.Corth = Corth
