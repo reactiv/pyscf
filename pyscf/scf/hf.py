@@ -42,6 +42,7 @@ PRE_ORTH_METHOD = getattr(__config__, 'scf_analyze_pre_orth_method', 'ANO')
 MO_BASE = getattr(__config__, 'MO_BASE', 1)
 TIGHT_GRAD_CONV_TOL = getattr(__config__, 'scf_hf_kernel_tight_grad_conv_tol', True)
 MUTE_CHKFILE = getattr(__config__, 'scf_hf_SCF_mute_chkfile', False)
+_CAYLEY_GAP_REGULARIZER = .1
 
 remove_overlap_zero_eigenvalue = getattr(__config__, 'scf_hf_remove_overlap_zero_eigenvalue', True)
 overlap_zero_eigenvalue_threshold = getattr(__config__, 'scf_hf_overlap_zero_eigenvalue_threshold', 1e-6)
@@ -172,8 +173,28 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         last_hf_e = e_tot
 
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
-        mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
-        mo_occ = mf.get_occ(mo_energy, mo_coeff)
+        if cycle == 0:
+            mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
+            mo_occ = mf.get_occ(mo_energy, mo_coeff)
+        else:
+            fock_mo = reduce(numpy.dot, (mo_coeff.conj().T, fock, mo_coeff))
+            occidx = mo_occ > 0
+            viridx = ~occidx
+            gap = mo_energy[viridx,None] - mo_energy[occidx]
+            kappa_ai = -fock_mo[numpy.ix_(viridx, occidx)] * gap
+            kappa_ai /= gap**2 + _CAYLEY_GAP_REGULARIZER**2
+
+            kappa = numpy.zeros_like(fock_mo)
+            kappa[numpy.ix_(viridx, occidx)] = kappa_ai
+            kappa[numpy.ix_(occidx, viridx)] = -kappa_ai.conj().T
+            eye = numpy.eye(kappa.shape[0], dtype=kappa.dtype)
+            rotation = scipy.linalg.solve(eye - kappa * .5,
+                                          eye + kappa * .5,
+                                          check_finite=False)
+            mo_coeff = numpy.dot(mo_coeff, rotation)
+            fock_mo = reduce(numpy.dot, (rotation.conj().T,
+                                         fock_mo, rotation))
+            mo_energy = fock_mo.diagonal().real
         dm = mf.make_rdm1(mo_coeff, mo_occ)
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
