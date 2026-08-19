@@ -189,7 +189,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         # predicted interior minimum is accepted only after an exact build
         # verifies both sufficient decrease and improvement over alpha = 1.
         ddm = numpy.asarray(dm) - numpy.asarray(dm_last)
-        de0 = numpy.einsum('...ij,...ji->', fock_phys_last, ddm).real
+        de0 = numpy.einsum('...ij,...ji', fock_phys_last, ddm).sum().real
         curvature = e_tot - last_hf_e - de0
         line_search_alpha = 1.
         if de0 < 0 and curvature > 0:
