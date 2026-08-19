@@ -45,14 +45,106 @@ class CDIIS(lib.diis.DIIS):
         self.Corth = Corth
         self.damp = 0
 
+    @staticmethod
+    def _regularized_logdet(errvecs):
+        norms = numpy.asarray([numpy.linalg.norm(x) for x in errvecs])
+        scaled = [x / n if n != 0 else numpy.zeros_like(x)
+                  for x, n in zip(errvecs, norms)]
+        gram = numpy.asarray([[numpy.vdot(x, y) for y in scaled]
+                              for x in scaled])
+        gram = (gram + gram.conj().T) * .5
+        regularizer = max(100 * numpy.finfo(gram.real.dtype).eps, 1e-14)
+        return numpy.linalg.slogdet(
+            gram + regularizer * numpy.eye(len(errvecs)))[1].real
+
+    @staticmethod
+    def _dependent(errvecs, incoming):
+        norm = numpy.linalg.norm(incoming)
+        if norm == 0:
+            return True
+        unit = incoming / norm
+        units = []
+        for x in errvecs:
+            xnorm = numpy.linalg.norm(x)
+            if xnorm != 0:
+                units.append(x / xnorm)
+        if not units:
+            return False
+        gram = numpy.asarray([[numpy.vdot(x, y) for y in units]
+                              for x in units])
+        overlap = numpy.asarray([numpy.vdot(x, unit) for x in units])
+        eig, vec = numpy.linalg.eigh((gram + gram.conj().T) * .5)
+        tol = max(100 * numpy.finfo(gram.real.dtype).eps * len(units),
+                  1e-12)
+        mask = eig > tol
+        if not numpy.any(mask):
+            return False
+        coeff = numpy.dot(vec[:,mask].conj().T, overlap)
+        projected = numpy.sum(abs(coeff)**2 / eig[mask]).real
+        return 1 - min(projected, 1) <= tol
+
+    def _compact(self, keep):
+        errvecs = [numpy.asarray(self.get_err_vec(i)).copy() for i in keep]
+        vecs = [numpy.asarray(self.get_vec(i)).copy() for i in keep]
+        for i, (errvec, vec) in enumerate(zip(errvecs, vecs)):
+            self._store('e%d' % i, errvec)
+            self._store('x%d' % i, vec)
+        self._bookkeep = list(range(len(keep)))
+        self._head = len(keep)
+        if not keep:
+            self._H = None
+            return
+        self._H = numpy.zeros((self.space+1, self.space+1), errvecs[0].dtype)
+        self._H[0,1:] = self._H[1:,0] = 1
+        for i, xi in enumerate(errvecs):
+            for j in range(i+1):
+                value = numpy.vdot(xi, errvecs[j])
+                self._H[i+1,j+1] = value
+                self._H[j+1,i+1] = value.conjugate()
+
+    def _admit(self, errvec):
+        nd = self.get_num_vec()
+        if nd == 0:
+            return True
+        retained = [numpy.asarray(self.get_err_vec(i)) for i in range(nd)]
+        candidates = retained + [errvec.ravel()]
+        norms = numpy.asarray([numpy.linalg.norm(x) for x in candidates])
+
+        if nd < self.space:
+            if not self._dependent(retained, candidates[-1]):
+                return True
+            scores = [self._regularized_logdet(candidates[:i] +
+                                               candidates[i+1:])
+                      for i in range(nd)]
+            redundant = max(range(nd), key=lambda i: (scores[i], -i))
+            if norms[-1] >= norms[redundant]:
+                return False
+            self._compact([i for i in range(nd) if i != redundant])
+            return True
+
+        minimum = min(range(nd+1), key=lambda i: (norms[i], i))
+        evictable = [i for i in range(nd+1) if i != minimum]
+        scores = [(self._regularized_logdet(candidates[:i] +
+                                            candidates[i+1:]), -i, i)
+                  for i in evictable]
+        evict = max(scores)[2]
+        if evict == nd:
+            return False
+        self._compact([i for i in range(nd) if i != evict])
+        return True
+
     def update(self, s, d, f, *args, **kwargs):
         errvec = get_err_vec(s, d, f, self.Corth)
         logger.debug1(self, 'diis-norm(errvec)=%g', numpy.linalg.norm(errvec))
         f_prev = kwargs.get('f_prev', None)
         if abs(self.damp) < 1e-6 or f_prev is None:
-            xnew = lib.diis.DIIS.update(self, f, xerr=errvec)
+            f_diis = f
         else:
-            xnew = lib.diis.DIIS.update(self, f*(1-self.damp) + f_prev*self.damp, xerr=errvec)
+            f_diis = f*(1-self.damp) + f_prev*self.damp
+        if self._admit(errvec):
+            xnew = lib.diis.DIIS.update(self, f_diis, xerr=errvec)
+        else:
+            xnew = self.extrapolate().reshape(f.shape)
         if self.rollback > 0 and len(self._bookkeep) == self.space:
             self._bookkeep = self._bookkeep[-self.rollback:]
         return xnew
