@@ -165,6 +165,12 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     mf.pre_kernel(locals())
 
     fock_last = None
+    # The trust radius is initialized by the first fixed-point step, which
+    # leaves that step undamped.  Subsequent radii are updated only from an
+    # energy evaluated with the accepted density and its exact potential.
+    trust_radius = None
+    raw_step_norm_last = None
+    fock_model = mf.get_fock(h1e, s1e, vhf, dm)
     cput1 = log.timer('initialize scf', *cput0)
     mf.cycles = 0
     for cycle in range(mf.max_cycle):
@@ -174,15 +180,57 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
-        dm = mf.make_rdm1(mo_coeff, mo_occ)
+        dm_raw = mf.make_rdm1(mo_coeff, mo_occ)
+        raw_step = dm_raw - dm_last
+        raw_step_norm = numpy.linalg.norm(raw_step)
+        if trust_radius is None:
+            trust_radius = raw_step_norm
+
+        # A full step close to the requested residual tolerance guarantees
+        # that damping cannot create a new convergence point.  Keep the raw
+        # array (and its metadata) unchanged whenever the step is undamped.
+        force_full_step = raw_step_norm <= conv_tol_grad
+        if force_full_step or raw_step_norm == 0:
+            trust_alpha = 1.
+        else:
+            trust_alpha = min(1., trust_radius / raw_step_norm)
+        full_step = trust_alpha == 1.
+        if full_step:
+            dm = dm_raw
+        else:
+            dm = dm_last + trust_alpha * raw_step
+
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
+
+        predicted_decrease = -trust_alpha * numpy.einsum(
+            '...ij,...ji->', fock_model, raw_step).real
+        if predicted_decrease > numpy.finfo(float).eps:
+            trust_rho = (last_hf_e - e_tot) / predicted_decrease
+        else:
+            trust_rho = -numpy.inf
+        if raw_step_norm_last is None or raw_step_norm_last == 0:
+            residual_ratio = 1.
+        else:
+            residual_ratio = raw_step_norm / raw_step_norm_last
+
+        if raw_step_norm_last is not None:
+            accepted_step_norm = trust_alpha * raw_step_norm
+            if trust_rho < .25 or residual_ratio > 1.25:
+                trust_radius = max(numpy.finfo(float).eps,
+                                   min(trust_radius * .5,
+                                       accepted_step_norm * .5))
+            elif trust_rho > .75 and residual_ratio < .75:
+                trust_radius = max(trust_radius,
+                                   accepted_step_norm * 2.)
+        raw_step_norm_last = raw_step_norm
 
         # Here Fock matrix is h1e + vhf, without DIIS.  Calling get_fock
         # instead of the statement "fock = h1e + vhf" because Fock matrix may
         # be modified in some methods.
         fock_last = fock
         fock = mf.get_fock(h1e, s1e, vhf, dm)  # = h1e + vhf, no DIIS
+        fock_model = fock
         norm_gorb = numpy.linalg.norm(mf.get_grad(mo_coeff, mo_occ, fock))
         if not TIGHT_GRAD_CONV_TOL:
             norm_gorb = norm_gorb / numpy.sqrt(norm_gorb.size)
@@ -191,9 +239,9 @@ Keyword argument "init_dm" is replaced by "dm0"''')
                  cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
 
         if callable(mf.check_convergence):
-            scf_conv = mf.check_convergence(locals())
+            scf_conv = full_step and mf.check_convergence(locals())
         elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
-            scf_conv = True
+            scf_conv = full_step
 
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
