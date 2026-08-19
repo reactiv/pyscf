@@ -214,6 +214,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         dm = mf.make_rdm1(mo_coeff, mo_occ)
 
         predictor = False
+        exact_regressed = False
         if (predictor_enabled and predictor_ready and predictor_steps < 2 and
                 cycle + 7 < mf.max_cycle and exact_dm0 is not None):
             vhf_predict = _secant_veff(
@@ -259,6 +260,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
                 if ((attempted_predictor or predictor_steps) and
                         exact_contraction >= 1.):
                     predictor_enabled = False
+                    exact_regressed = True
                 predictor_ready = (predictor_enabled and
                                    exact_contraction < .5)
             exact_dm0, exact_vhf0 = exact_dm1, exact_vhf1
@@ -269,7 +271,9 @@ Keyword argument "init_dm" is replaced by "dm0"''')
             log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
                      cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
 
-            if callable(mf.check_convergence):
+            if exact_regressed:
+                scf_conv = False
+            elif callable(mf.check_convergence):
                 scf_conv = mf.check_convergence(locals())
             elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
                 scf_conv = True
