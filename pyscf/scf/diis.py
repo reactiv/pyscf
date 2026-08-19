@@ -247,7 +247,7 @@ class HystereticDIIS(lib.diis.DIIS):
         else:
             q = residual / self._last_residual
 
-        energy_noise = max(self.conv_tol * .1, 100 * numpy.finfo(float).eps)
+        energy_noise = max(self.conv_tol, 100 * numpy.finfo(float).eps)
         if self._last_energy is None:
             energy_change = 0.
             requested = 'ediis'
@@ -260,7 +260,7 @@ class HystereticDIIS(lib.diis.DIIS):
             else:
                 requested = 'adiis'
 
-        self._select_phase(requested, q)
+        self._select_phase(requested, energy_change, energy_noise, q)
 
         # Keep independent, warm histories.  No extrapolator's minimization or
         # subspace policy is modified by the controller.
@@ -278,28 +278,24 @@ class HystereticDIIS(lib.diis.DIIS):
         self._last_residual = residual
         return focks[self._phase]
 
-    def _select_phase(self, requested, q):
-        # Divergence is handled immediately.  Transitions toward a more
-        # aggressive method need two consecutive samples; CDIIS falls back to
-        # ADIIS only after two samples beyond the wider q=0.8 boundary.
-        if requested == 'ediis':
-            self._phase = 'ediis'
+    def _select_phase(self, requested, energy_change, energy_noise, q):
+        # Move forward as soon as contraction supports it.  Falling back to a
+        # more conservative method needs two consecutive samples, and CDIIS
+        # uses the wider q=0.8 boundary to avoid phase chatter.
+        rank = {'ediis': 0, 'adiis': 1, 'cdiis': 2}
+        if rank[requested] >= rank[self._phase]:
+            self._phase = requested
             self._pending_phase = None
             self._pending_count = 0
             return
 
-        if self._phase == 'cdiis' and requested == 'adiis' and q <= .8:
+        if (self._phase == 'cdiis' and requested == 'adiis' and
+            energy_change <= energy_noise and q <= .8):
             self._pending_phase = None
             self._pending_count = 0
             return
 
-        if self._phase == 'ediis' and requested == 'cdiis':
-            requested = 'adiis'
-
-        if requested == self._phase:
-            self._pending_phase = None
-            self._pending_count = 0
-        elif requested == self._pending_phase:
+        if requested == self._pending_phase:
             self._pending_count += 1
         else:
             self._pending_phase = requested
