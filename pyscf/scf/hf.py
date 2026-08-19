@@ -46,6 +46,32 @@ MUTE_CHKFILE = getattr(__config__, 'scf_hf_SCF_mute_chkfile', False)
 remove_overlap_zero_eigenvalue = getattr(__config__, 'scf_hf_remove_overlap_zero_eigenvalue', True)
 overlap_zero_eigenvalue_threshold = getattr(__config__, 'scf_hf_overlap_zero_eigenvalue_threshold', 1e-6)
 
+
+def _secant_veff(dm, exact_dm0, exact_vhf0, exact_dm1, exact_vhf1):
+    '''Predict the effective potential from the two latest exact checkpoints.
+
+    The coefficient is the Frobenius projection of the density displacement
+    onto the checkpoint secant.  Clipping limits extrapolation when the SCF
+    density takes a step that is poorly represented by that secant.
+    '''
+    try:
+        ddm = numpy.asarray(exact_dm1) - numpy.asarray(exact_dm0)
+        dtrial = numpy.asarray(dm) - numpy.asarray(exact_dm1)
+        dvhf = numpy.asarray(exact_vhf1) - numpy.asarray(exact_vhf0)
+    except (TypeError, ValueError):
+        return None
+    if ddm.shape != dtrial.shape or numpy.asarray(exact_vhf1).shape != dvhf.shape:
+        return None
+    denom = numpy.vdot(ddm, ddm).real
+    scale = max(numpy.vdot(exact_dm1, exact_dm1).real, 1.)
+    if not numpy.isfinite(denom) or denom <= numpy.finfo(float).eps * scale:
+        return None
+    alpha = numpy.vdot(ddm, dtrial).real / denom
+    if not numpy.isfinite(alpha):
+        return None
+    alpha = numpy.clip(alpha, -.5, 1.5)
+    return numpy.asarray(exact_vhf1) + alpha * dvhf
+
 def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
            dump_chk=True, dm0=None, callback=None, conv_check=True, **kwargs):
     '''kernel: the SCF driver.
@@ -165,18 +191,37 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     mf.pre_kernel(locals())
 
     fock_last = None
+    exact_dm0 = exact_vhf0 = None
+    exact_dm1, exact_vhf1 = dm, vhf
+    exact_norm_gorb = None
+    predictor_steps = 0
+    predictor_enabled = True
+    predictor_ready = False
+    vhf_predicted = False
     cput1 = log.timer('initialize scf', *cput0)
     mf.cycles = 0
     for cycle in range(mf.max_cycle):
         dm_last = dm
         last_hf_e = e_tot
 
-        fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
+        # Predicted potentials are never admitted to the DIIS history.  This
+        # keeps fallback checkpoints on the ordinary exact-build trajectory.
+        diis_for_cycle = None if vhf_predicted else mf_diis
+        fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, diis_for_cycle,
+                           fock_last=fock_last)
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
-        vhf = mf.get_veff(mol, dm, dm_last, vhf)
-        e_tot = mf.energy_tot(dm, h1e, vhf)
+
+        predictor = False
+        if (predictor_enabled and predictor_ready and predictor_steps < 2 and
+                cycle + 7 < mf.max_cycle and exact_dm0 is not None):
+            vhf_predict = _secant_veff(
+                dm, exact_dm0, exact_vhf0, exact_dm1, exact_vhf1)
+            if vhf_predict is not None:
+                vhf = vhf_predict
+                predictor = True
+        attempted_predictor = predictor
 
         # Here Fock matrix is h1e + vhf, without DIIS.  Calling get_fock
         # instead of the statement "fock = h1e + vhf" because Fock matrix may
@@ -187,15 +232,51 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         if not TIGHT_GRAD_CONV_TOL:
             norm_gorb = norm_gorb / numpy.sqrt(norm_gorb.size)
         norm_ddm = numpy.linalg.norm(dm-dm_last)
-        log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
-                 cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
 
-        if callable(mf.check_convergence):
-            scf_conv = mf.check_convergence(locals())
-        elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
-            scf_conv = True
+        # A predicted potential is useful only while the fixed-point residual
+        # contracts.  Failed contraction is resolved by an exact construction
+        # in the same iteration, so no predicted energy is ever reported.
+        if predictor and (not numpy.isfinite(norm_gorb) or
+                          norm_gorb >= norm_gorb_last):
+            predictor = False
 
-        if dump_chk and mf.chkfile:
+        if predictor:
+            predictor_steps += 1
+            vhf_predicted = True
+            log.info('cycle= %d secant-predicted  |g|= %4.3g  |ddm|= %4.3g',
+                     cycle+1, norm_gorb, norm_ddm)
+        else:
+            vhf = mf.get_veff(mol, dm, exact_dm1, exact_vhf1)
+            e_tot = mf.energy_tot(dm, h1e, vhf)
+            fock = mf.get_fock(h1e, s1e, vhf, dm)
+            norm_gorb = numpy.linalg.norm(mf.get_grad(mo_coeff, mo_occ, fock))
+            if not TIGHT_GRAD_CONV_TOL:
+                norm_gorb = norm_gorb / numpy.sqrt(norm_gorb.size)
+
+            if exact_norm_gorb is not None:
+                exact_contraction = norm_gorb / max(exact_norm_gorb,
+                                                    numpy.finfo(float).tiny)
+                if ((attempted_predictor or predictor_steps) and
+                        exact_contraction >= 1.):
+                    predictor_enabled = False
+                predictor_ready = (predictor_enabled and
+                                   exact_contraction < .5)
+            exact_dm0, exact_vhf0 = exact_dm1, exact_vhf1
+            exact_dm1, exact_vhf1 = dm, vhf
+            exact_norm_gorb = norm_gorb
+            predictor_steps = 0
+            vhf_predicted = False
+            log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
+                     cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
+
+            if callable(mf.check_convergence):
+                scf_conv = mf.check_convergence(locals())
+            elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
+                scf_conv = True
+
+        norm_gorb_last = norm_gorb
+
+        if not predictor and dump_chk and mf.chkfile:
             mf.dump_chk(locals())
 
         if callable(callback):
@@ -205,6 +286,25 @@ Keyword argument "init_dm" is replaced by "dm0"''')
 
         if scf_conv:
             break
+
+    # max_cycle can be reached on a predictor step.  Refresh the potential so
+    # that even a non-converged return carries an exact energy for its density.
+    if vhf_predicted:
+        dm_last = exact_dm1
+        last_hf_e = e_tot
+        vhf = mf.get_veff(mol, dm, exact_dm1, exact_vhf1)
+        e_tot = mf.energy_tot(dm, h1e, vhf)
+        fock = mf.get_fock(h1e, s1e, vhf, dm)
+        norm_gorb = numpy.linalg.norm(mf.get_grad(mo_coeff, mo_occ, fock))
+        if not TIGHT_GRAD_CONV_TOL:
+            norm_gorb = norm_gorb / numpy.sqrt(norm_gorb.size)
+        norm_ddm = numpy.linalg.norm(dm-dm_last)
+        vhf_predicted = False
+        log.info('Final exact checkpoint  E= %.15g  delta_E= %4.3g  '
+                 '|g|= %4.3g  |ddm|= %4.3g',
+                 e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
+        if dump_chk and mf.chkfile:
+            mf.dump_chk(locals())
 
     mf.cycles = cycle + 1
     if scf_conv and conv_check:
