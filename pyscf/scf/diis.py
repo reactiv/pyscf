@@ -39,7 +39,7 @@ DEBUG = False
 # error vector = F_ai ~ (S-SDS)*S^{-1}FDS = FDS - SDFDS ~ FDS-SDF in converge
 class CDIIS(lib.diis.DIIS):
     def __init__(self, mf=None, filename=None, Corth=None):
-        lib.diis.DIIS.__init__(self, mf, filename)
+        lib.diis.DIIS.__init__(self, mf, None)
         self.rollback = 0
         self.space = 8
         self.Corth = Corth
@@ -227,7 +227,8 @@ class HystereticDIIS(lib.diis.DIIS):
         self.conv_tol = 1e-9
         self.conv_tol_grad = numpy.sqrt(self.conv_tol)
 
-        self._cdiis = CDIIS(mf, _subspace_filename(filename, 'cdiis'), Corth)
+        # Keep the traditional CDIIS restart file at the user-supplied path.
+        self._cdiis = CDIIS(mf, filename, Corth)
         self._adiis = ADIIS(mf, _subspace_filename(filename, 'adiis'))
         self._ediis = EDIIS(mf, _subspace_filename(filename, 'ediis'))
         self._phase = 'ediis'
