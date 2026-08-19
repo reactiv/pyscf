@@ -47,7 +47,8 @@ class CDIIS(lib.diis.DIIS):
 
     def update(self, s, d, f, *args, **kwargs):
         errvec = get_err_vec(s, d, f, self.Corth)
-        logger.debug1(self, 'diis-norm(errvec)=%g', numpy.linalg.norm(errvec))
+        if self.verbose >= logger.DEBUG1:
+            logger.debug1(self, 'diis-norm(errvec)=%g', numpy.linalg.norm(errvec))
         f_prev = kwargs.get('f_prev', None)
         if abs(self.damp) < 1e-6 or f_prev is None:
             xnew = lib.diis.DIIS.update(self, f, xerr=errvec)
