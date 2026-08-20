@@ -164,6 +164,43 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     # A preprocessing hook before the SCF iteration
     mf.pre_kernel(locals())
 
+    def set_direct_scf_cutoff(cutoff):
+        nopt = 0
+        seen = set()
+
+        def update_opt(opt):
+            nonlocal nopt
+            if opt is None or id(opt) in seen:
+                return
+            seen.add(id(opt))
+            if isinstance(opt, dict):
+                for value in opt.values():
+                    update_opt(value)
+            elif isinstance(opt, (tuple, list)):
+                for value in opt:
+                    update_opt(value)
+            elif hasattr(opt, 'direct_scf_tol'):
+                opt.direct_scf_tol = cutoff
+                nopt += 1
+
+        update_opt(getattr(mf, '_opt', None))
+        return nopt
+
+    reference_cutoff = mf.direct_scf_tol
+    adaptive_screening = (mf.direct_scf and reference_cutoff > 0 and
+                          set_direct_scf_cutoff(reference_cutoff) > 0)
+    # The vhf lineage is certified while every build since the most recent
+    # full-density (non-incremental) rebuild ran at the reference cutoff.
+    # The initial vhf above is such a build, so certification starts True.
+    lineage_certified = True
+    full_rebuild_pending = False
+    tail_locked = not adaptive_screening
+    scheduled_cutoff = numpy.sqrt(reference_cutoff) if adaptive_screening else 0.
+    current_cutoff = reference_cutoff
+    drift_budget = 0.
+    drift_cap = 0.1 * conv_tol
+    norm_gorb_last = None
+
     fock_last = None
     cput1 = log.timer('initialize scf', *cput0)
     mf.cycles = 0
@@ -175,7 +212,17 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
-        vhf = mf.get_veff(mol, dm, dm_last, vhf)
+        if full_rebuild_pending:
+            # Certification rebuild: this already-scheduled veff evaluation is
+            # executed as a full-density build at the reference cutoff,
+            # discarding all screening drift accumulated in the adaptive
+            # phase.  It replaces, not adds, a build.
+            vhf = mf.get_veff(mol, dm)
+            full_rebuild_pending = False
+            lineage_certified = True
+            drift_budget = 0.
+        else:
+            vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
 
         # Here Fock matrix is h1e + vhf, without DIIS.  Calling get_fock
@@ -191,9 +238,53 @@ Keyword argument "init_dm" is replaced by "dm0"''')
                  cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
 
         if callable(mf.check_convergence):
-            scf_conv = mf.check_convergence(locals())
-        elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
-            scf_conv = True
+            cycle_converged = mf.check_convergence(locals())
+        else:
+            cycle_converged = (abs(e_tot-last_hf_e) < conv_tol and
+                               norm_gorb < conv_tol_grad)
+        # Convergence may only be declared on a cycle whose vhf lineage since
+        # the last full-density rebuild is entirely at the reference cutoff.
+        scf_conv = cycle_converged and lineage_certified
+
+        if adaptive_screening and not scf_conv and not full_rebuild_pending:
+            if current_cutoff > reference_cutoff:
+                # Upper-bound surrogate for the incremental Fock
+                # contributions screened out by this cycle's loosened cutoff:
+                # the screening test is q_ij*q_kl*|ddm| < cutoff, so the
+                # neglected contribution scales with cutoff * ||ddm||_1.
+                drift_budget += current_cutoff * float(
+                    numpy.abs(numpy.asarray(dm) - numpy.asarray(dm_last)).sum())
+            if not tail_locked:
+                # Predicted number of remaining cycles from the observed
+                # orbital-gradient contraction ratio.
+                if norm_gorb_last is not None and norm_gorb > 0:
+                    rho = min(max(norm_gorb/norm_gorb_last, 0.05), 0.9)
+                    remaining = (numpy.log(conv_tol_grad/norm_gorb)
+                                 / numpy.log(rho))
+                else:
+                    remaining = None
+                next_cutoff = min(scheduled_cutoff,
+                                  numpy.sqrt(reference_cutoff),
+                                  reference_cutoff
+                                  * max(1., norm_gorb/conv_tol_grad)**2)
+                switch = (cycle_converged or
+                          drift_budget > drift_cap or
+                          next_cutoff <= reference_cutoff or
+                          (remaining is not None and remaining <= 2))
+                if switch:
+                    if current_cutoff > reference_cutoff or cycle_converged:
+                        set_direct_scf_cutoff(reference_cutoff)
+                        full_rebuild_pending = True
+                        lineage_certified = False
+                    tail_locked = True
+                    scheduled_cutoff = reference_cutoff
+                    current_cutoff = reference_cutoff
+                else:
+                    set_direct_scf_cutoff(next_cutoff)
+                    scheduled_cutoff = next_cutoff
+                    current_cutoff = next_cutoff
+                    lineage_certified = False
+            norm_gorb_last = norm_gorb
 
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
