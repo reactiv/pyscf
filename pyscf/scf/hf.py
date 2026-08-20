@@ -199,6 +199,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     current_cutoff = reference_cutoff
     grad_ratio_window = []
     norm_gorb_last = None
+    last_built_loosened = False
 
     fock_last = None
     cput1 = log.timer('initialize scf', *cput0)
@@ -245,15 +246,23 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         scf_conv = cycle_converged and lineage_certified
 
         if adaptive_screening and not scf_conv and not full_rebuild_pending:
+            # Cutoff used by the vhf build of this cycle (the controller
+            # below only decides the cutoff for the next build).
+            built_loosened = current_cutoff > reference_cutoff
             if not tail_locked:
                 # Rolling window of the last three loosened-phase
-                # orbital-gradient contraction ratios r_i = |g_i|/|g_{i-1}|.
-                # Their geometric mean (clamped) forecasts the number of
-                # remaining cycles; with fewer than two observed ratios the
-                # forecast abstains and only the residual-coupled bound
-                # below can drive the cutoff back to the reference.
-                if (norm_gorb_last is not None and norm_gorb_last > 0
-                        and norm_gorb > 0):
+                # orbital-gradient contraction ratios r_i = |g_i|/|g_{i-1}|,
+                # collected only when both gradients were measured from
+                # loosened-cutoff builds (the entry ratio against the
+                # reference-built initial Fock is not a loosened-phase
+                # contraction).  Their geometric mean (clamped) forecasts
+                # the number of remaining cycles; with fewer than two
+                # observed ratios the forecast abstains and only the
+                # residual-coupled bound below can drive the cutoff back
+                # to the reference.
+                if (built_loosened and last_built_loosened
+                        and norm_gorb_last is not None
+                        and norm_gorb_last > 0 and norm_gorb > 0):
                     grad_ratio_window.append(norm_gorb/norm_gorb_last)
                     del grad_ratio_window[:-3]
                 if len(grad_ratio_window) >= 2 and norm_gorb > 0:
@@ -293,6 +302,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
                     current_cutoff = next_cutoff
                     lineage_certified = False
             norm_gorb_last = norm_gorb
+            last_built_loosened = built_loosened
 
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
