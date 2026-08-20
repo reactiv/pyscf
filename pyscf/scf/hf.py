@@ -198,7 +198,8 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     scheduled_cutoff = numpy.sqrt(reference_cutoff) if adaptive_screening else 0.
     current_cutoff = reference_cutoff
     drift_budget = 0.
-    drift_cap = 0.1 * conv_tol
+    drift_cap = 0.1
+    g_floor = None
     norm_gorb_last = None
 
     fock_last = None
@@ -247,13 +248,24 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         scf_conv = cycle_converged and lineage_certified
 
         if adaptive_screening and not scf_conv and not full_rebuild_pending:
-            if current_cutoff > reference_cutoff:
+            # Smallest genuine orbital-gradient residual observed so far.
+            # Non-increasing, so the per-unit-drift charge below is
+            # non-decreasing and the budget tightens monotonically as the
+            # SCF converges.
+            if norm_gorb > 0 and (g_floor is None or norm_gorb < g_floor):
+                g_floor = norm_gorb
+            if current_cutoff > reference_cutoff and g_floor is not None:
                 # Upper-bound surrogate for the incremental Fock
                 # contributions screened out by this cycle's loosened cutoff:
                 # the screening test is q_ij*q_kl*|ddm| < cutoff, so the
                 # neglected contribution scales with cutoff * ||ddm||_1.
+                # Charged in dimensionless form against the smallest
+                # orbital-gradient norm of the same Fock matrix, so the
+                # cumulative budget bounds screening noise relative to the
+                # genuine residual the SCF is contracting.
                 drift_budget += current_cutoff * float(
-                    numpy.abs(numpy.asarray(dm) - numpy.asarray(dm_last)).sum())
+                    numpy.abs(numpy.asarray(dm) - numpy.asarray(dm_last)).sum()
+                ) / g_floor
             if not tail_locked:
                 # Predicted number of remaining cycles from the observed
                 # orbital-gradient contraction ratio.
