@@ -200,6 +200,13 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     drift_budget = 0.
     drift_cap = 0.1 * conv_tol
     norm_gorb_last = None
+    # One-shot shadow-pair calibration of the drift surrogate: pending until
+    # the first incremental build the schedule would run at a loosened
+    # cutoff.  kappa_safe rescales the a-priori surrogate cutoff*||ddm||_1
+    # to the empirically realized energy-projected perturbation, making the
+    # accumulated drift commensurate with the energy-scale cap above.
+    calibration_pending = adaptive_screening
+    kappa_safe = 1.
 
     fock_last = None
     cput1 = log.timer('initialize scf', *cput0)
@@ -221,6 +228,40 @@ Keyword argument "init_dm" is replaced by "dm0"''')
             full_rebuild_pending = False
             lineage_certified = True
             drift_budget = 0.
+        elif calibration_pending and current_cutoff > reference_cutoff:
+            # One-shot shadow-pair calibration on the first would-be-loosened
+            # increment: evaluate the same (dm, dm_last, vhf) increment once
+            # at the probe cutoff and once at the reference cutoff.  Only the
+            # reference-cutoff result is propagated, so this cycle introduces
+            # zero screening drift and the lineage stays certified; the probe
+            # build is purely a measurement of the realized energy-projected
+            # perturbation per unit of the surrogate cutoff*||ddm||_1.
+            calibration_pending = False
+            c_probe = numpy.sqrt(reference_cutoff)
+            set_direct_scf_cutoff(c_probe)
+            vhf_probe = mf.get_veff(mol, dm, dm_last, vhf)
+            set_direct_scf_cutoff(reference_cutoff)
+            vhf = mf.get_veff(mol, dm, dm_last, vhf)
+            ddm_l1 = float(numpy.abs(numpy.asarray(dm)
+                                     - numpy.asarray(dm_last)).sum())
+            e_probe = abs(float(numpy.einsum(
+                '...ij,...ji->',
+                numpy.asarray(vhf_probe) - numpy.asarray(vhf),
+                numpy.asarray(dm))))
+            if ddm_l1 > 0:
+                # The fixed safety factor 16 absorbs error of the
+                # linear-in-cutoff calibration model; the epsilon floor
+                # guards an exactly-zero measurement.  Miscalibration can
+                # only cost performance, never correctness: the certified
+                # reference rebuild discards all adaptive-phase drift.
+                kappa_safe = max(16. * e_probe / (c_probe * ddm_l1),
+                                 numpy.finfo(float).eps)
+            log.debug('shadow-pair screening calibration: e_probe=%.6g '
+                      'ddm_l1=%.6g kappa_safe=%.6g', e_probe, ddm_l1,
+                      kappa_safe)
+            vhf_probe = None
+            current_cutoff = reference_cutoff
+            lineage_certified = True
         else:
             vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
@@ -248,11 +289,14 @@ Keyword argument "init_dm" is replaced by "dm0"''')
 
         if adaptive_screening and not scf_conv and not full_rebuild_pending:
             if current_cutoff > reference_cutoff:
-                # Upper-bound surrogate for the incremental Fock
+                # Calibrated surrogate for the incremental Fock
                 # contributions screened out by this cycle's loosened cutoff:
-                # the screening test is q_ij*q_kl*|ddm| < cutoff, so the
-                # neglected contribution scales with cutoff * ||ddm||_1.
-                drift_budget += current_cutoff * float(
+                # the screening test is q_ij*q_kl*|ddm| < cutoff, a linear
+                # threshold in the cutoff, so the neglected contribution
+                # scales with cutoff * ||ddm||_1; kappa_safe maps that
+                # a-priori surrogate onto the empirically measured
+                # energy-projected perturbation.
+                drift_budget += kappa_safe * current_cutoff * float(
                     numpy.abs(numpy.asarray(dm) - numpy.asarray(dm_last)).sum())
             if not tail_locked:
                 # Predicted number of remaining cycles from the observed
