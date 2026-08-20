@@ -165,6 +165,10 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     mf.pre_kernel(locals())
 
     fock_last = None
+    trust_radius = None
+    trust_prev_residual = None
+    trust_prev_ratio = None
+    trust_prev_rho = None
     cput1 = log.timer('initialize scf', *cput0)
     mf.cycles = 0
     for cycle in range(mf.max_cycle):
@@ -174,9 +178,77 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
-        dm = mf.make_rdm1(mo_coeff, mo_occ)
+        dm_raw = mf.make_rdm1(mo_coeff, mo_occ)
+        trust_step = numpy.asarray(dm_raw) - numpy.asarray(dm_last)
+        trust_residual = numpy.linalg.norm(trust_step)
+        if trust_radius is None:
+            # The first fixed-point update is intentionally a full step.
+            trust_radius = trust_residual
+        if trust_prev_residual is None or trust_prev_residual == 0:
+            trust_residual_ratio = numpy.nan
+        else:
+            trust_residual_ratio = trust_residual / trust_prev_residual
+
+        # Restore full fixed-point steps before the orbital-gradient test can
+        # report convergence.  A full step also retains the tagged orbital
+        # representation used by fast density evaluators.
+        trust_force_full = trust_residual <= 10 * conv_tol_grad
+        if trust_residual == 0 or trust_force_full:
+            trust_alpha = 1.
+        else:
+            trust_cap = trust_radius / trust_residual
+            # During a stable geometric contraction of the fixed-point
+            # residual the remaining correction is approximated by the
+            # series limit p/(1-q).  Over-relax only when the previous
+            # accepted step agreed with the linear energy model and two
+            # consecutive contraction ratios are both small and mutually
+            # consistent; otherwise keep the one-sided damping rule.
+            stable_contraction = (
+                trust_prev_ratio is not None and
+                numpy.isfinite(trust_residual_ratio) and
+                numpy.isfinite(trust_prev_ratio) and
+                trust_residual_ratio < .9 and trust_prev_ratio < .9 and
+                abs(trust_residual_ratio - trust_prev_ratio) <= .25)
+            model_agrees = (trust_prev_rho is not None and
+                            numpy.isfinite(trust_prev_rho) and
+                            .5 <= trust_prev_rho <= 1.5)
+            if stable_contraction and model_agrees and trust_cap >= 1:
+                trust_alpha = min(1. / (1. - trust_residual_ratio), 3.,
+                                  trust_cap)
+            else:
+                trust_alpha = min(1., trust_cap)
+        if trust_alpha == 1:
+            dm = dm_raw
+        else:
+            dm = numpy.asarray(dm_last) + trust_alpha * trust_step
+
+        # First-order energy model from the physical Fock h1e + vhf already
+        # evaluated at dm_last; no additional potential or Fock build.
+        trust_predicted = -trust_alpha * numpy.vdot(
+            numpy.asarray(h1e) + numpy.asarray(vhf), trust_step).real
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
+
+        trust_actual = last_hf_e - e_tot
+        if trust_predicted > numpy.finfo(float).eps:
+            trust_rho = trust_actual / trust_predicted
+        else:
+            trust_rho = -numpy.inf
+        poor_model = (not numpy.isfinite(trust_rho) or trust_rho < .25)
+        residual_expanded = (numpy.isfinite(trust_residual_ratio) and
+                             trust_residual_ratio > 1.)
+        good_model = trust_rho > .75
+        residual_contracted = (numpy.isfinite(trust_residual_ratio) and
+                               trust_residual_ratio < .75)
+        if poor_model or residual_expanded:
+            trust_radius = max(.5 * trust_alpha * trust_residual,
+                               10 * numpy.finfo(float).eps)
+        elif good_model and residual_contracted:
+            trust_radius = max(trust_radius,
+                               2 * trust_alpha * trust_residual)
+        trust_prev_residual = trust_residual
+        trust_prev_ratio = trust_residual_ratio
+        trust_prev_rho = trust_rho
 
         # Here Fock matrix is h1e + vhf, without DIIS.  Calling get_fock
         # instead of the statement "fock = h1e + vhf" because Fock matrix may
@@ -191,9 +263,10 @@ Keyword argument "init_dm" is replaced by "dm0"''')
                  cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
 
         if callable(mf.check_convergence):
-            scf_conv = mf.check_convergence(locals())
+            scf_conv = (trust_alpha == 1 and
+                        mf.check_convergence(locals()))
         elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
-            scf_conv = True
+            scf_conv = trust_alpha == 1
 
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
