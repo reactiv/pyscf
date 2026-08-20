@@ -197,9 +197,9 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     tail_locked = not adaptive_screening
     scheduled_cutoff = numpy.sqrt(reference_cutoff) if adaptive_screening else 0.
     current_cutoff = reference_cutoff
-    drift_budget = 0.
-    drift_cap = 0.1 * conv_tol
-    norm_gorb_last = None
+    # Fixed fraction of the current orbital-gradient norm that the estimated
+    # omitted incremental Fock contribution of a loosened build may reach.
+    screening_error_fraction = 0.01
 
     fock_last = None
     cput1 = log.timer('initialize scf', *cput0)
@@ -220,7 +220,6 @@ Keyword argument "init_dm" is replaced by "dm0"''')
             vhf = mf.get_veff(mol, dm)
             full_rebuild_pending = False
             lineage_certified = True
-            drift_budget = 0.
         else:
             vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
@@ -246,45 +245,39 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         # the last full-density rebuild is entirely at the reference cutoff.
         scf_conv = cycle_converged and lineage_certified
 
-        if adaptive_screening and not scf_conv and not full_rebuild_pending:
-            if current_cutoff > reference_cutoff:
-                # Upper-bound surrogate for the incremental Fock
-                # contributions screened out by this cycle's loosened cutoff:
-                # the screening test is q_ij*q_kl*|ddm| < cutoff, so the
-                # neglected contribution scales with cutoff * ||ddm||_1.
-                drift_budget += current_cutoff * float(
-                    numpy.abs(numpy.asarray(dm) - numpy.asarray(dm_last)).sum())
-            if not tail_locked:
-                # Predicted number of remaining cycles from the observed
-                # orbital-gradient contraction ratio.
-                if norm_gorb_last is not None and norm_gorb > 0:
-                    rho = min(max(norm_gorb/norm_gorb_last, 0.05), 0.9)
-                    remaining = (numpy.log(conv_tol_grad/norm_gorb)
-                                 / numpy.log(rho))
-                else:
-                    remaining = None
-                next_cutoff = min(scheduled_cutoff,
-                                  numpy.sqrt(reference_cutoff),
-                                  reference_cutoff
-                                  * max(1., norm_gorb/conv_tol_grad)**2)
-                switch = (cycle_converged or
-                          drift_budget > drift_cap or
-                          next_cutoff <= reference_cutoff or
-                          (remaining is not None and remaining <= 2))
-                if switch:
-                    if current_cutoff > reference_cutoff or cycle_converged:
-                        set_direct_scf_cutoff(reference_cutoff)
-                        full_rebuild_pending = True
-                        lineage_certified = False
-                    tail_locked = True
-                    scheduled_cutoff = reference_cutoff
-                    current_cutoff = reference_cutoff
-                else:
-                    set_direct_scf_cutoff(next_cutoff)
-                    scheduled_cutoff = next_cutoff
-                    current_cutoff = next_cutoff
+        if (adaptive_screening and not scf_conv and not full_rebuild_pending
+                and not tail_locked):
+            # Stateless per-cycle omitted-Fock bound.  The direct-SCF
+            # screening test drops shell quadruplets with
+            # q_ij*q_kl*|ddm| < cutoff, so the incremental Fock contribution
+            # omitted by a build at cutoff c is bounded by the surrogate
+            # c * ||ddm||_1.  Choosing the next cutoff no larger than
+            # eta * norm_gorb / ||ddm||_1 keeps the estimated omission below
+            # the fixed fraction eta of the current orbital-gradient
+            # residual, so each cycle's screening perturbation is
+            # proportional to a contracting residual and the total drift is
+            # bounded by a convergent geometric series without any
+            # cross-cycle accumulator.  Monotone tightening follows from the
+            # min with the previously scheduled cutoff.
+            ddm_l1 = float(
+                numpy.abs(numpy.asarray(dm) - numpy.asarray(dm_last)).sum())
+            next_cutoff = min(scheduled_cutoff,
+                              numpy.sqrt(reference_cutoff),
+                              screening_error_fraction * norm_gorb
+                              / max(ddm_l1, numpy.finfo(numpy.float64).tiny))
+            if cycle_converged or next_cutoff <= reference_cutoff:
+                if current_cutoff > reference_cutoff or cycle_converged:
+                    set_direct_scf_cutoff(reference_cutoff)
+                    full_rebuild_pending = True
                     lineage_certified = False
-            norm_gorb_last = norm_gorb
+                tail_locked = True
+                scheduled_cutoff = reference_cutoff
+                current_cutoff = reference_cutoff
+            else:
+                set_direct_scf_cutoff(next_cutoff)
+                scheduled_cutoff = next_cutoff
+                current_cutoff = next_cutoff
+                lineage_certified = False
 
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
