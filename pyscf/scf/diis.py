@@ -45,9 +45,86 @@ class CDIIS(lib.diis.DIIS):
         self.Corth = Corth
         self.damp = 0
 
+    # Adaptive-depth residual-norm trust window with angular-coherence
+    # eviction for the retained CDIIS subspace.  Stale residuals recorded far
+    # from the current iterate violate the local-linearity assumption behind
+    # Pulay extrapolation; discarding them by residual-norm ratio keeps the
+    # extrapolation conditioned (cf. Chupin, Dupuy, Legendre & Sere,
+    # ESAIM M2AN 55 (2021) 2785, adaptive-depth restarted DIIS).
+    # Fixed universal constants, applied identically to every system:
+    _TRUST_RADIUS = 100.       # radial window ||e_i|| <= R*||e_new||
+    _COHERENCE_THRESHOLD = 0.98  # |<e_i/||e_i||, e_j/||e_j||>| eviction bound
+    _RETAIN_FLOOR = 3          # most recent pairs always retained
+
+    def _trust_window(self, errvec):
+        '''Slot indices of stored residuals inside the radial trust window
+        ||e_i|| <= R * ||e_new|| (R = 100).'''
+        nd = self.get_num_vec()
+        radius = self._TRUST_RADIUS * numpy.linalg.norm(errvec)
+        keep = []
+        for i in range(nd):
+            ei = numpy.asarray(self.get_err_vec(i))
+            if numpy.linalg.norm(ei) <= radius:
+                keep.append(i)
+        return keep
+
+    def _coherence_prune(self, keep):
+        '''Among the surviving residuals, evict the larger-norm (staler)
+        member of any pair whose normalized overlap is >= 0.98.  The
+        min(nd, 3) most recent pairs are always retained, regardless of the
+        trust window and coherence rules.'''
+        nd = self.get_num_vec()
+        protected = set(self._bookkeep[-min(nd, self._RETAIN_FLOOR):])
+        survivors = set(keep) | protected
+        # chronological order (oldest first) as recorded in _bookkeep
+        keep = [i for i in self._bookkeep if i in survivors]
+        vecs = [numpy.asarray(self.get_err_vec(i)) for i in keep]
+        norms = [numpy.linalg.norm(v) for v in vecs]
+        units = [v/n if n != 0 else v for v, n in zip(vecs, norms)]
+        evicted = set()
+        for a in range(len(keep)):
+            if keep[a] in evicted:
+                continue
+            for b in range(a+1, len(keep)):
+                if keep[a] in evicted:
+                    break
+                if keep[b] in evicted:
+                    continue
+                if abs(numpy.vdot(units[a], units[b])) >= self._COHERENCE_THRESHOLD:
+                    stale = a if norms[a] >= norms[b] else b
+                    if keep[stale] not in protected:
+                        evicted.add(keep[stale])
+        return [i for i in keep if i not in evicted]
+
+    def _compact(self, keep):
+        '''Re-store the surviving (Fock, residual) pairs in slots 0..n-1 and
+        rebuild _bookkeep, _head and the cached inner-product matrix _H from
+        the unmodified stored vectors.'''
+        errvecs = [numpy.asarray(self.get_err_vec(i)).copy() for i in keep]
+        vecs = [numpy.asarray(self.get_vec(i)).copy() for i in keep]
+        for i, (errvec, vec) in enumerate(zip(errvecs, vecs)):
+            self._store('e%d' % i, errvec)
+            self._store('x%d' % i, vec)
+        self._bookkeep = list(range(len(keep)))
+        self._head = len(keep)
+        if not keep:
+            self._H = None
+            return
+        self._H = numpy.zeros((self.space+1, self.space+1), errvecs[0].dtype)
+        self._H[0,1:] = self._H[1:,0] = 1
+        for i, xi in enumerate(errvecs):
+            for j in range(i+1):
+                value = numpy.vdot(xi, errvecs[j])
+                self._H[i+1,j+1] = value
+                self._H[j+1,i+1] = value.conjugate()
+
     def update(self, s, d, f, *args, **kwargs):
         errvec = get_err_vec(s, d, f, self.Corth)
         logger.debug1(self, 'diis-norm(errvec)=%g', numpy.linalg.norm(errvec))
+        if self.rollback == 0 and self.get_num_vec() > 0:
+            keep = self._coherence_prune(self._trust_window(errvec))
+            if len(keep) < self.get_num_vec():
+                self._compact(keep)
         f_prev = kwargs.get('f_prev', None)
         if abs(self.damp) < 1e-6 or f_prev is None:
             xnew = lib.diis.DIIS.update(self, f, xerr=errvec)
