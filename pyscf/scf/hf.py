@@ -195,11 +195,16 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     lineage_certified = True
     full_rebuild_pending = False
     tail_locked = not adaptive_screening
-    scheduled_cutoff = numpy.sqrt(reference_cutoff) if adaptive_screening else 0.
     current_cutoff = reference_cutoff
-    drift_budget = 0.
-    drift_cap = 0.1 * conv_tol
+    # Pre-loosening observation window: the reference cutoff is held until
+    # two consecutive contraction ratios of the orbital gradient and the
+    # density step have been observed.  Their geometric means (clipped to
+    # [0.05, 0.95]) define the contraction trend the sentinel compares
+    # against while the cutoff is loosened.
+    contraction_ratios = []
+    rho_g = rho_d = None
     norm_gorb_last = None
+    norm_ddm_last = None
 
     fock_last = None
     cput1 = log.timer('initialize scf', *cput0)
@@ -220,7 +225,6 @@ Keyword argument "init_dm" is replaced by "dm0"''')
             vhf = mf.get_veff(mol, dm)
             full_rebuild_pending = False
             lineage_certified = True
-            drift_budget = 0.
         else:
             vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
@@ -246,45 +250,67 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         # the last full-density rebuild is entirely at the reference cutoff.
         scf_conv = cycle_converged and lineage_certified
 
-        if adaptive_screening and not scf_conv and not full_rebuild_pending:
+        if (adaptive_screening and not scf_conv and not full_rebuild_pending
+                and not tail_locked):
+            if (norm_gorb_last is not None
+                    and norm_gorb_last > 0 and norm_ddm_last > 0):
+                ratio_g = norm_gorb / norm_gorb_last
+                ratio_d = norm_ddm / norm_ddm_last
+            else:
+                ratio_g = ratio_d = None
+            # Residual-coupled descent schedule (unchanged from the parent):
+            # the loosened cutoff tracks the square of the distance of the
+            # orbital gradient from its convergence threshold.
+            next_cutoff = min(numpy.sqrt(reference_cutoff),
+                              reference_cutoff
+                              * max(1., norm_gorb/conv_tol_grad)**2)
             if current_cutoff > reference_cutoff:
-                # Upper-bound surrogate for the incremental Fock
-                # contributions screened out by this cycle's loosened cutoff:
-                # the screening test is q_ij*q_kl*|ddm| < cutoff, so the
-                # neglected contribution scales with cutoff * ||ddm||_1.
-                drift_budget += current_cutoff * float(
-                    numpy.abs(numpy.asarray(dm) - numpy.asarray(dm_last)).sum())
-            if not tail_locked:
-                # Predicted number of remaining cycles from the observed
-                # orbital-gradient contraction ratio.
-                if norm_gorb_last is not None and norm_gorb > 0:
-                    rho = min(max(norm_gorb/norm_gorb_last, 0.05), 0.9)
-                    remaining = (numpy.log(conv_tol_grad/norm_gorb)
-                                 / numpy.log(rho))
-                else:
-                    remaining = None
-                next_cutoff = min(scheduled_cutoff,
-                                  numpy.sqrt(reference_cutoff),
-                                  reference_cutoff
-                                  * max(1., norm_gorb/conv_tol_grad)**2)
-                switch = (cycle_converged or
-                          drift_budget > drift_cap or
-                          next_cutoff <= reference_cutoff or
-                          (remaining is not None and remaining <= 2))
-                if switch:
-                    if current_cutoff > reference_cutoff or cycle_converged:
-                        set_direct_scf_cutoff(reference_cutoff)
-                        full_rebuild_pending = True
-                        lineage_certified = False
+                # Sentinel: the loosened cutoff is trusted only while both
+                # observables keep contracting at no worse than half the
+                # pre-loosening digits-per-cycle rate, i.e. this cycle's
+                # ratio must not exceed sqrt(rho).  An unobservable ratio
+                # counts as a violation.
+                sentinel_violated = (ratio_g is None or
+                                     ratio_g > numpy.sqrt(rho_g) or
+                                     ratio_d > numpy.sqrt(rho_d))
+                if (sentinel_violated or cycle_converged or
+                        next_cutoff <= reference_cutoff):
+                    # One-way certified fallback: restore the reference
+                    # cutoff on every _opt object, execute the next already-
+                    # scheduled veff evaluation as a full-density rebuild at
+                    # the reference cutoff, and lock the tail so every
+                    # subsequent build is a reference-cutoff incremental.
+                    # No re-loosening can occur.
+                    set_direct_scf_cutoff(reference_cutoff)
+                    full_rebuild_pending = True
+                    lineage_certified = False
                     tail_locked = True
-                    scheduled_cutoff = reference_cutoff
                     current_cutoff = reference_cutoff
                 else:
                     set_direct_scf_cutoff(next_cutoff)
-                    scheduled_cutoff = next_cutoff
                     current_cutoff = next_cutoff
                     lineage_certified = False
+            else:
+                # Observation window at the reference cutoff: record the
+                # pre-loosening contraction trend before any loosening.
+                if ratio_g is not None:
+                    contraction_ratios.append((ratio_g, ratio_d))
+                if len(contraction_ratios) >= 2:
+                    ratios = numpy.array(contraction_ratios)
+                    rho_g = min(max(float(
+                        numpy.exp(numpy.log(ratios[:,0]).mean())), 0.05), 0.95)
+                    rho_d = min(max(float(
+                        numpy.exp(numpy.log(ratios[:,1]).mean())), 0.05), 0.95)
+                    if next_cutoff > reference_cutoff:
+                        set_direct_scf_cutoff(next_cutoff)
+                        current_cutoff = next_cutoff
+                        lineage_certified = False
+                    else:
+                        # Already inside the reference regime; the lineage
+                        # is certified, so simply lock the tail.
+                        tail_locked = True
             norm_gorb_last = norm_gorb
+            norm_ddm_last = norm_ddm
 
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
