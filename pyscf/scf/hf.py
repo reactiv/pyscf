@@ -244,10 +244,9 @@ Keyword argument "init_dm" is replaced by "dm0"''')
             vhf = mf.get_veff(mol, dm, dm_last, vhf)
             ddm_l1 = float(numpy.abs(numpy.asarray(dm)
                                      - numpy.asarray(dm_last)).sum())
-            e_probe = abs(float(numpy.einsum(
-                '...ij,...ji->',
-                numpy.asarray(vhf_probe) - numpy.asarray(vhf),
-                numpy.asarray(dm))))
+            dv = numpy.asarray(vhf_probe) - numpy.asarray(vhf)
+            e_probe = float(abs(
+                (dv * numpy.swapaxes(numpy.asarray(dm), -1, -2)).sum()))
             if ddm_l1 > 0:
                 # The fixed safety factor 16 absorbs error of the
                 # linear-in-cutoff calibration model; the epsilon floor
