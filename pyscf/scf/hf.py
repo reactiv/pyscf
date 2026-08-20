@@ -197,8 +197,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     tail_locked = not adaptive_screening
     scheduled_cutoff = numpy.sqrt(reference_cutoff) if adaptive_screening else 0.
     current_cutoff = reference_cutoff
-    drift_budget = 0.
-    drift_cap = 0.1 * conv_tol
+    grad_ratio_window = []
     norm_gorb_last = None
 
     fock_last = None
@@ -220,7 +219,6 @@ Keyword argument "init_dm" is replaced by "dm0"''')
             vhf = mf.get_veff(mol, dm)
             full_rebuild_pending = False
             lineage_certified = True
-            drift_budget = 0.
         else:
             vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
@@ -247,28 +245,38 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         scf_conv = cycle_converged and lineage_certified
 
         if adaptive_screening and not scf_conv and not full_rebuild_pending:
-            if current_cutoff > reference_cutoff:
-                # Upper-bound surrogate for the incremental Fock
-                # contributions screened out by this cycle's loosened cutoff:
-                # the screening test is q_ij*q_kl*|ddm| < cutoff, so the
-                # neglected contribution scales with cutoff * ||ddm||_1.
-                drift_budget += current_cutoff * float(
-                    numpy.abs(numpy.asarray(dm) - numpy.asarray(dm_last)).sum())
             if not tail_locked:
-                # Predicted number of remaining cycles from the observed
-                # orbital-gradient contraction ratio.
-                if norm_gorb_last is not None and norm_gorb > 0:
-                    rho = min(max(norm_gorb/norm_gorb_last, 0.05), 0.9)
+                # Rolling window of the last three loosened-phase
+                # orbital-gradient contraction ratios r_i = |g_i|/|g_{i-1}|.
+                # Their geometric mean (clamped) forecasts the number of
+                # remaining cycles; with fewer than two observed ratios the
+                # forecast abstains and only the residual-coupled bound
+                # below can drive the cutoff back to the reference.
+                if (norm_gorb_last is not None and norm_gorb_last > 0
+                        and norm_gorb > 0):
+                    grad_ratio_window.append(norm_gorb/norm_gorb_last)
+                    del grad_ratio_window[:-3]
+                if len(grad_ratio_window) >= 2 and norm_gorb > 0:
+                    rho_hat = min(max(float(numpy.exp(numpy.mean(
+                        numpy.log(grad_ratio_window)))), 0.05), 0.95)
                     remaining = (numpy.log(conv_tol_grad/norm_gorb)
-                                 / numpy.log(rho))
+                                 / numpy.log(rho_hat))
                 else:
                     remaining = None
+                # The forecast is only trustworthy while the gradient
+                # contracts monotonically and steadily; otherwise lock the
+                # certified reference tail immediately.
+                noncontractive = any(r >= 1. for r in grad_ratio_window)
+                oscillatory = (len(grad_ratio_window) >= 2 and
+                               max(grad_ratio_window)
+                               > 4. * min(grad_ratio_window))
                 next_cutoff = min(scheduled_cutoff,
                                   numpy.sqrt(reference_cutoff),
                                   reference_cutoff
                                   * max(1., norm_gorb/conv_tol_grad)**2)
                 switch = (cycle_converged or
-                          drift_budget > drift_cap or
+                          noncontractive or
+                          oscillatory or
                           next_cutoff <= reference_cutoff or
                           (remaining is not None and remaining <= 2))
                 if switch:
